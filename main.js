@@ -1,5 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
 import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
 import { hasSecretWriteToken, setRepoSecret } from "./utils/githubSecrets.js";
 import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } from "./utils/safeLog.js";
@@ -8,6 +6,7 @@ import { close_api, delay, send, startService, waitForApi } from "./utils/utils.
 import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
 import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
+import { mergeVipExpiries, readCheckinStatus, writeCheckinStatus } from "./utils/checkinStatus.js";
 
 /**
  * 读取进程 stdin 的全部内容（用于从父进程安全接收凭据）。
@@ -71,6 +70,13 @@ async function main() {
   const doneSet = stateEnabled ? loadDoneToday(date) : new Set()
   let skippedCount = 0
 
+  // WebUI 拉起时把各账号 VIP 到期时间写盘（供「账号管理」展示）；Actions/命令行不设置该变量。
+  const statusFile = process.env.CHECKIN_STATUS_FILE
+  // 文件里已有的映射：用于①跳过账号的到期时间刷新判断 ②写盘时与旧数据合并（绝不能整份覆盖）
+  const existingStatus = statusFile ? readCheckinStatus(statusFile) : { vipExpiry: {}, vipExpiryAt: {} }
+  // 本轮实际查到（或保留了旧值）的到期时间，写盘时与 existingStatus.vipExpiry 合并
+  const vipExpiryAt = { ...existingStatus.vipExpiryAt }
+
   const errorMsg = {}
   // 通知结果收集（并行完成后按账号原始顺序填充）
   const notifyResults = []
@@ -80,7 +86,7 @@ async function main() {
 
   // 单账号完整签到流程：并行时各账号独立执行，账号内部保持原有请求节奏（VIP 领取间隔 30s）
   async function processAccount(user, index) {
-    const tag = `[#${index + 1}/${userinfo.length}]`
+    const tag = `[#${String(index + 1).padStart(String(userinfo.length).length, '0')}/${userinfo.length}]`
     const accountErrors = {} // 该账号的错误集（键名含账号标识，账号之间互不冲突，可安全并行写入）
     try {
       // 手动触发：当日已完成签到（无任何错误）的账号直接跳过，不再请求酷狗 API
@@ -88,6 +94,23 @@ async function main() {
         const safeUserId = maskIdentifier(user.userid)
         printYellow(`${tag} 账号 ${safeUserId} 今日已签到，跳过`)
         skippedCount++
+        // 刷新账号管理面板的 VIP 到期时间：今日已签到的账号本轮不会再走下面的
+        // VIP 详情查询，若不补一次，面板会一直停在旧值或「未获取」。
+        // 为了避免每次手动触发都对全部已签到账号重查（跳过机制本就是为了减少请求），
+        // 仅当该账号的到期时间不是今天查到的时候才补一次。
+        if (statusFile && vipExpiryAt[String(user.userid)] !== date) {
+          try {
+            const headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+            const vipInfo = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
+            const end = vipInfo?.status === 1 && Array.isArray(vipInfo.data?.busi_vip) && vipInfo.data.busi_vip.length > 0
+              ? vipInfo.data.busi_vip[0].vip_end_time
+              : null
+            if (end) {
+              vipExpiries[String(user.userid)] = end
+              vipExpiryAt[String(user.userid)] = date
+            }
+          } catch { /* 刷新失败不影响跳过，保留文件里的旧值 */ }
+        }
         return {
           nickname: safeUserId, status: '跳过', listen: '今日已签到',
           vipClaim: '-', vipExpiry: '-', error: ''
@@ -111,24 +134,32 @@ async function main() {
           }
         }
         const safeNickname = maskDisplayName(userDetail.data.nickname)
-        printMagenta(`${tag} 账号 ${safeNickname} 开始领取VIP...`)
+        printMagenta(`${tag} 账号 ${safeNickname} 开始签到`)
 
         // 周日刷新token
         if (isBeijingSunday(now)) {
           const refreshToken = await send(`/login/token?timestrap=${Date.now()}`, "POST", headers)
-          if (refreshToken?.status == 1) {
-            if (refreshToken?.data?.token !== user.token) {
-              needRefresh = true
-              printYellow(`${tag} 账号 ${safeNickname} 需要刷新token`)
-              user.token = refreshToken.data.token
-              // 用新 token 重建本次请求的 headers，使后续听歌/VIP 领取使用刷新后的凭证
-              headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
-            }
+          // 必须校验新 token 确实是非空字符串：上游偶发返回 status=1 却不带 data.token，
+          // 旧写法 `data.token !== user.token` 在此时成立（undefined !== 旧值），会把
+          // user.token 赋成 undefined；随后整份凭据数组被 JSON.stringify 写回（undefined
+          // 字段直接消失），该账号永久失效、只能手工重新登录。
+          // 结论：宁可这次不刷新，也绝不能把空值写进凭据。
+          const rawNewToken = refreshToken?.status == 1 ? refreshToken?.data?.token : null
+          const newToken = typeof rawNewToken === 'string' ? rawNewToken.trim() : ''
+          if (newToken && newToken !== String(user.token || '').trim()) {
+            needRefresh = true
+            printYellow(`${tag} 账号 ${safeNickname} 需要刷新token`)
+            user.token = newToken
+            // 用新 token 重建本次请求的 headers，使后续听歌/VIP 领取使用刷新后的凭证
+            headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
+          } else if (refreshToken?.status == 1 && !newToken) {
+            // 刷新接口返回成功但没给有效 token：保持原 token 继续本次签到
+            printYellow(`${tag} 账号 ${safeNickname} token 刷新响应缺少有效 token，已保留原 token`)
           }
         }
 
         // 开始听歌
-        printYellow(`${tag} 开始听歌领取VIP...`)
+        printYellow(`${tag} 账号 ${safeNickname} 开始听歌领取VIP...`)
         // 听歌获取vip
         const listen = await send(`/youth/listen/song?timestrap=${Date.now()}`, "GET", headers)
 
@@ -136,20 +167,19 @@ async function main() {
         // 听歌是否成功（含"今日已领取"）：决定该账号当日是否已被标记为完成
         let listenOk = false
         if (listen.status === 1) {
-          printGreen(`${tag} 听歌领取成功`)
+          printGreen(`${tag} 账号 ${safeNickname} 听歌领取成功`)
           listenStatus = '成功'
           listenOk = true
         } else if (listen.error_code === 130012) {
-          printGreen(`${tag} 今日已领取`)
+          printGreen(`${tag} 账号 ${safeNickname} 今日已领取`)
           listenStatus = '今日已领取'
           listenOk = true
         } else {
           accountErrors[`${safeNickname} listen`] = summarizeResponse(listen)
-          printRed(`${tag} 听歌领取失败`)
+          printRed(`${tag} 账号 ${safeNickname} 听歌领取失败`)
           listenStatus = '失败'
         }
 
-        printYellow(`${tag} 开始领取VIP...`)
         let claimCount = 0
         let claimTotal = 0
         // 领取阶段是否出现"非预期"失败：仅此类失败阻止当天标记完成。
@@ -159,18 +189,18 @@ async function main() {
           const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
           claimTotal = i
           if (ad.status === 1) {
-            printGreen(`${tag} 第${i}次领取成功`)
+            printGreen(`${tag} 账号 ${safeNickname} 第${i}次领取成功`)
             claimCount++
             if (i != 8) {
               await delay(30 * 1000)
             }
           } else if (ad.error_code === 30002) {
-            printGreen(`${tag} 今天次数已用光`)
+            printGreen(`${tag} 账号 ${safeNickname} 今天次数已用光`)
             // 次数用光：把总次数记为已尝试次数，避免通知里出现 3/7 这类含混计数
             claimTotal = claimCount
             break
           } else {
-            printRed(`${tag} 第${i}次领取失败`)
+            printRed(`${tag} 账号 ${safeNickname} 第${i}次领取失败`)
             accountErrors[`${safeNickname} ad`] = summarizeResponse(ad)
             claimFailed = true
             claimTotal = claimCount
@@ -185,10 +215,10 @@ async function main() {
           // 到期时间不再刷进实时日志（改在 WebUI「账号管理」查看，避免每账号 2 行刷屏），
           // 但仍会写入通知内容与账号状态文件；WebUI 模式下通过 CHECKIN_STATUS_FILE 上报。
           if (!process.env.CHECKIN_STATUS_FILE) {
-            printBlue(`${tag} VIP到期时间：${vipExpiry}\n`)
+            printBlue(`${tag} 账号 ${safeNickname} VIP到期时间：${vipExpiry}\n`)
           }
         } else {
-          printRed(`${tag} 获取失败\n`)
+          printRed(`${tag} 账号 ${safeNickname} VIP 详情获取失败\n`)
           accountErrors[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
         }
 
@@ -201,7 +231,7 @@ async function main() {
         if (listenOk && !vipDetailFailed && stateEnabled) {
           doneSet.add(String(user.userid))
           if (claimFailed) {
-            printYellow(`${tag} 今日听歌已完成，领取失败不影响标记（手动触发将跳过该账号）`)
+            printYellow(`${tag} 账号 ${safeNickname} 今日听歌已完成，领取失败不影响标记`)
           }
         }
 
@@ -209,6 +239,7 @@ async function main() {
         // 顺带记录到期时间，供 WebUI「账号管理」展示（仅在有状态文件时收集）
         if (process.env.CHECKIN_STATUS_FILE) {
           vipExpiries[String(user.userid)] = vipExpiry
+          if (vipExpiry !== '未知') vipExpiryAt[String(user.userid)] = date
         }
         return {
           nickname: safeNickname,
@@ -273,21 +304,16 @@ async function main() {
 
   // 把本轮查到的 VIP 到期时间写盘，供 WebUI「账号管理」展示。
   // 仅在 WebUI 拉起签到子进程时设置 CHECKIN_STATUS_FILE；Actions/命令行不写。
-  const statusFile = process.env.CHECKIN_STATUS_FILE
-  if (statusFile && Object.keys(vipExpiries).length > 0) {
-    try {
-      const tmp = `${statusFile}.tmp`
-      fs.mkdirSync(path.dirname(statusFile), { recursive: true })
-      fs.writeFileSync(
-        tmp,
-        JSON.stringify({ updatedAt: new Date().toISOString(), date, vipExpiry: vipExpiries }, null, 2),
-        'utf8'
-      )
-      fs.renameSync(tmp, statusFile)
-    } catch (e) {
-      // 写盘失败不影响签到结果，仅在详细模式下提示
-      printYellow(`警告：账号状态写入失败（${e.message}）`)
-    }
+  // 必须与文件里已有数据合并而不是整份覆盖：手动触发会跳过当日已签到的账号，
+  // 被跳过的账号本轮不查询 VIP 详情，覆盖写会把之前（定时任务）写好的到期时间全部抹掉。
+  if (statusFile) {
+    const result = writeCheckinStatus(statusFile, {
+      date,
+      vipExpiry: mergeVipExpiries(existingStatus.vipExpiry, vipExpiries),
+      vipExpiryAt,
+    })
+    // 写盘失败不影响签到结果，但必须显式告警，否则面板会一直停在旧值
+    if (!result.ok) printYellow(`警告：账号状态写入失败（${result.error}）`)
   }
 
   // 持久化当日已完成签到的账号（跨天自动失效），供手动触发时跳过
@@ -304,7 +330,16 @@ async function main() {
   // 刷新后的凭据持久化：Docker 部署写入 USERINFO_FILE 文件（挂载卷），
   // Actions 部署写入 GitHub Secret <USERINFO>（使用完整 userinfo 数组，保留所有用户包括过期账号）
   let secretError = null
-  if (needRefresh) {
+  // 兜底校验：写回前确认每个账号的 token 都是非空字符串。
+  // 凭据文件/Secret 是整份覆盖写的，写进一次 undefined（JSON 序列化会直接丢掉该字段）
+  // 就意味着该账号永久失效，所以宁可本次不写回也不要把残缺数组落盘。
+  const invalidUsers = needRefresh
+    ? userinfo.filter(u => !u || typeof u.token !== 'string' || !u.token.trim())
+    : []
+  if (invalidUsers.length > 0) {
+    printRed(`凭据校验失败：${invalidUsers.length} 个账号的 token 无效，已跳过本次凭据写回（原凭据保持不变）`)
+  }
+  if (needRefresh && invalidUsers.length === 0) {
     const userinfoJSON = JSON.stringify(userinfo)
     // 优先写本地凭据文件（Docker 模式），写失败时降级走 PAT
     let savedToFile = false

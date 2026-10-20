@@ -146,6 +146,10 @@ main {
 @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
 .panel-head {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
   font-size: 15px;
   margin-bottom: 18px;
   padding-bottom: 10px;
@@ -196,7 +200,6 @@ main {
 .run-block .input { max-width: 240px; }
 
 /* 方案 B：面板标题右侧的齿轮图标按钮（管理员功能入口） */
-.panel-head { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; }
 .icon-btn {
   margin-left: auto;
   padding: 2px 8px;
@@ -373,10 +376,11 @@ select.input { width: auto; min-width: 80px; }
 
 /* 账号序号「[#4/28]」定宽显示：同一账号及不同账号的后续文字都从同一列开始。
    用固定像素宽度而非 ch（ch 依赖字体实际字形宽度，在回退字体下会漂移）。
-   宽度按最长的「[#28/28]」估足，保证 1 位与 2 位序号不错列。 */
+   序号在 main.js 中已零填充为等宽（[#01/36]…[#36/36]），此处再给一个固定下限，
+   保证任意等宽字体/字号下所有编号都占同一列。 */
 .term-body .line .acct-tag {
   display: inline-block;
-  min-width: 62px;
+  min-width: 72px;
   color: #6e7681;
 }
 
